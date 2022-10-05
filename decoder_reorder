@@ -31,7 +31,7 @@ for word in set(sum(french, ())):
         tm[(word,)] = [models.phrase(word, 0.0)]
 
 sys.stderr.write("Decoding %s...\n" % (opts.input,))
-for f in french:
+for sent_idx, f in enumerate(french):
     # The following code implements a monotone decoding
     # algorithm (one that doesn't permute the target phrases).
     # Hence all hypotheses in stacks[i] represent translations of
@@ -46,21 +46,18 @@ for f in french:
             for j in range(i + 1, len(f) + 1):
                 if f[i:j] in tm:
                     for phrase in tm[f[i:j]]:
-                        # The monotone, unchanged
                         logprob = h.logprob + phrase.logprob
-
                         lm_state = h.lm_state
                         for word in phrase.english.split():
                             (lm_state, word_logprob) = lm.score(lm_state, word)
                             logprob += word_logprob
                         logprob += lm.end(lm_state) if j == len(f) else 0.0
                         new_hypothesis = hypothesis(logprob, lm_state, h, phrase)
-
                         if lm_state not in stacks[j] or stacks[j][
                             lm_state].logprob < logprob:  # second case is recombination
                             stacks[j][lm_state] = new_hypothesis
 
-                # we will iterate through every possible adjacent phrases
+                # iterate through every possible adjacent phrases
                 # phrase2 can extend from end of phrase1 until the end of tm
                 for k in range(i + 1, j):
                     if f[i:k] in tm and f[k:j] in tm:
