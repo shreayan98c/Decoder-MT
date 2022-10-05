@@ -11,7 +11,7 @@ import numpy as np
 biphrase = namedtuple("biphrase", "source, target, distance")
 node = namedtuple("node", "w, b")
 LARGE = 1e8
-NLARGE = -1e8
+NLARGE = -1e2
 
 def get_lm_distance(lm, phrase):
   distance = 0.0
@@ -72,7 +72,7 @@ def gtsp_to_tsp(gtsp, clusters):
       u = cluster[u_idx]
       v_next = cluster[(u_idx+1)%len(cluster)]
       for v in range(tsp.shape[1]):
-        if NLARGE < tsp[u, v] < LARGE:
+        if NLARGE < tsp[u, v] and tsp[u, v] < LARGE:
           tsp[v_before, v] = tsp[u, v]
           tsp[u, v] = LARGE   
       tsp[u, v_next] = NLARGE
@@ -85,17 +85,21 @@ def solve_tsp(tsp):
   return opt_tour
 
 def tour_to_sentence(opt_tour, phrase_map):
-  translation = []
+  biphrases = []
   tm_distance = 0.
   words = []
   for n in opt_tour:
     if n == len(phrase_map):
       continue
+    # print(phrase_map[n])
     if len(words) > 0 and words[-1] == phrase_map[n].w:
       continue
-    translation.extend(phrase_map[n].b.target)
+    if len(biphrases) > 0 and biphrases[-1] == phrase_map[n].b.target:
+      continue
+    biphrases.append(phrase_map[n].b.target)
     words.append(phrase_map[n].w)
     tm_distance += phrase_map[n].b.distance
+  translation = sum(biphrases,())
   return tuple(translation), tm_distance, words
 
 def main(opts):
