@@ -100,7 +100,7 @@ def tour_to_sentence(opt_tour, phrase_map):
     words.append(phrase_map[n].w)
     tm_distance += phrase_map[n].b.distance
   translation = sum(biphrases,())
-  return tuple(translation), tm_distance, words
+  return translation, tm_distance, words
 
 def main(opts):
   tm = models.TM(opts.tm, opts.k)
