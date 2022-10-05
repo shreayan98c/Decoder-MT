@@ -1,0 +1,145 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+from collections import namedtuple, defaultdict
+from python_tsp.heuristics import solve_tsp_local_search, solve_tsp_simulated_annealing
+# from python_tsp.exact import solve_tsp_dynamic_programming
+import numpy as np
+# import ipdb
+
+biphrase = namedtuple("biphrase", "source, target, distance")
+node = namedtuple("node", "w, b")
+LARGE = 1e8
+NLARGE = -1e8
+
+def get_lm_distance(lm, phrase):
+  distance = 0.0
+  lm_state = (phrase[0],)
+  for i in range(1, len(phrase)):
+    (lm_state, word_logprob) = lm.score(lm_state, phrase[i])
+    distance += -word_logprob
+  return distance
+
+def create_word_biphrase_table(ss, tm, top_s):  
+  word_biphrase_table = defaultdict(list)
+  for i in range(len(ss)-1):
+    for j in range(i+1, len(ss)):
+      ssp = ss[i:j]
+      if ssp in tm:
+        for tsp in tm[ssp]:
+          for ssw in ssp:
+            word_biphrase_table[ssw].append(biphrase(ssp, tuple(tsp.english.split()), -tsp.logprob))
+  
+  for ssw in word_biphrase_table: # prune all but top s translations
+    word_biphrase_table[ssw].sort(key=lambda x: x.distance)
+    del word_biphrase_table[ssw][top_s:] 
+
+  return word_biphrase_table
+
+def create_gtsp(word_biphrase_table, lm, ss):
+  nodes = [node(ssw, b) for ssw, bs in word_biphrase_table.items() for b in bs]
+  gtsp = np.ones((len(nodes)+1, len(nodes)+1)) * LARGE
+  clusters = defaultdict(set)
+  for i in range(1, len(nodes)):
+    for j in range(1, len(nodes)):
+
+      if i == j:
+        continue
+
+      if nodes[i].w == nodes[j].w:
+        clusters[nodes[i].w].add(j)
+      elif nodes[i].b == nodes[j].b and nodes[j].b.source.index(nodes[j].w) - nodes[i].b.source.index(nodes[i].w) == 1 :
+        gtsp[i, j] = 0.
+      elif nodes[i].w == nodes[i].b.source[-1] and nodes[j].w == nodes[j].b.source[0]:
+        tm_distance = nodes[i].b.distance
+        lm_distance = get_lm_distance(lm=lm, phrase=nodes[i].b.target+nodes[j].b.target)
+        ds_distance = abs(ss.index(nodes[j].w) - ss.index(nodes[i].w) - 1)
+        gtsp[i, j] = tm_distance + lm_distance + ds_distance
+  
+  for n in range(len(nodes)):   
+      gtsp[-1, n] = get_lm_distance(lm=lm, phrase=("<s>",)+nodes[n].b.target) + ss.index(nodes[n].w)
+      gtsp[n, -1] = nodes[n].b.distance + get_lm_distance(lm=lm, phrase=nodes[n].b.target+("</s>",)) + len(ss) - ss.index(nodes[n].w) - 1
+
+  return gtsp, clusters, nodes
+
+def gtsp_to_tsp(gtsp, clusters):
+  tsp = np.copy(gtsp)
+  for w in clusters:
+    cluster = list(clusters[w])
+    for u_idx in range(len(cluster)):
+      v_before = cluster[(u_idx-1)%len(cluster)]
+      u = cluster[u_idx]
+      v_next = cluster[(u_idx+1)%len(cluster)]
+      for v in range(tsp.shape[1]):
+        if NLARGE < tsp[u, v] < LARGE:
+          tsp[v_before, v] = tsp[u, v]
+          tsp[u, v] = LARGE   
+      tsp[u, v_next] = NLARGE
+      
+  return tsp
+
+def solve_tsp(tsp):
+  opt_tour, _ = solve_tsp_local_search(tsp, x0=solve_tsp_simulated_annealing(tsp)[0], perturbation_scheme="two_opt")
+  # opt_tour, _ = solve_tsp_dynamic_programming(tsp)
+  return opt_tour
+
+def tour_to_sentence(opt_tour, phrase_map):
+  translation = []
+  tm_distance = 0.
+  words = []
+  for n in opt_tour:
+    if n == len(phrase_map):
+      continue
+    if len(words) > 0 and words[-1] == phrase_map[n].w:
+      continue
+    translation.extend(phrase_map[n].b.target)
+    words.append(phrase_map[n].w)
+    tm_distance += phrase_map[n].b.distance
+  return tuple(translation), tm_distance, words
+
+def main(opts):
+  tm = models.TM(opts.tm, opts.k)
+  lm = models.LM(opts.lm)
+  source = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+
+  # tm should translate unknown words as-is with probability 1
+  for word in set(sum(source,())):
+    if (word,) not in tm:
+      tm[(word,)] = [models.phrase(word, 0.0)]
+
+  sys.stderr.write("Decoding %s...\n" % (opts.input,))
+  
+  for ss in source: 
+    if opts.verbose:
+      print("Creating biphrase table ...", file=sys.stderr)
+    word_biphrase_table = create_word_biphrase_table(ss=ss, tm=tm, top_s=opts.s)
+    if opts.verbose:
+      print("Creating GTSP ...", file=sys.stderr)
+    gtsp, clusters, phrase_map = create_gtsp(word_biphrase_table=word_biphrase_table, lm=lm, ss=ss)  
+    if opts.verbose:
+      print("Converting GTSP to ATSP ...", file=sys.stderr)
+    tsp = gtsp_to_tsp(gtsp=gtsp, clusters=clusters)
+    if opts.verbose:
+      print("Solving ATSP ...", file=sys.stderr)
+    opt_tour = solve_tsp(tsp=tsp)
+    translation, tm_distance, words = tour_to_sentence(opt_tour=opt_tour, phrase_map=phrase_map)
+
+    print(" ".join(translation))
+    
+    if opts.verbose:
+      lm_distance = get_lm_distance(lm=lm, phrase=("<s>",)+translation+("</s>",))
+      sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % (lm_distance, tm_distance, tm_distance + lm_distance))
+
+if __name__ == "__main__":
+  optparser = optparse.OptionParser()
+  optparser.add_option("-i", "--input", dest="input", default="data/input", help="File containing sentences to translate (default=data/input)")
+  optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm", help="File containing translation model (default=data/tm)")
+  optparser.add_option("-l", "--language-model", dest="lm", default="data/lm", help="File containing ARPA-format language model (default=data/lm)")
+  optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxsize, type="int", help="Number of sentences to decode (default=no limit)")
+  optparser.add_option("-k", "--translations-per-phrase", dest="k", default=10, type="int", help="Limit on number of translations to consider per phrase (default=2)")
+  optparser.add_option("-s", "--word-biphrase-size", dest="s", default=2, type="int", help="Maximum biphrases for a word belongs to (default=2)")
+  optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
+  opts = optparser.parse_args()[0]
+
+  main(opts)
