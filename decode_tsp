@@ -3,25 +3,40 @@ import optparse
 import sys
 import models
 from collections import namedtuple, defaultdict
-# from python_tsp.heuristics import solve_tsp_local_search, solve_tsp_simulated_annealing
+from python_tsp.heuristics import solve_tsp_local_search, solve_tsp_simulated_annealing
 from python_tsp.exact import solve_tsp_dynamic_programming
 import numpy as np
-import ipdb
-import pandas as pd
 
+# helper classes and constants
 biphrase = namedtuple("biphrase", "source, target, distance")
 node = namedtuple("node", "w, b")
 LARGE = 1e8
 NLARGE = -1e4
 
+# calculate language model logprob as distance
+# Args:
+#   lm [models.LM]: language model
+#   phrase [tuple]: phrase
+# Returns:
+#   distance [float]: language model logprob as distance
 def get_lm_distance(lm, phrase):
   distance = 0.0
   lm_state = (phrase[0],)
   for i in range(1, len(phrase)):
     (lm_state, word_logprob) = lm.score(lm_state, phrase[i])
+    # use negative value to make it a distance value
     distance += -word_logprob
   return distance
 
+# creates a word-biphrase table
+# generates possible biphrases the source words are a part of
+# prunes `top_s` biphrases per source word based on translation model (tm) distance
+# Args:
+#   ss [str]: source sentence
+#   tm [models.TM]: translation model
+#   top_s [int]: no of top biphrases per source word to keep 
+# Returns:
+#   word_biphrase_table [Dict(biphrase)]
 def create_word_biphrase_table(ss, tm, top_s):  
   word_biphrase_table = defaultdict(list)
   for i in range(len(ss)-1):
@@ -30,45 +45,74 @@ def create_word_biphrase_table(ss, tm, top_s):
       if ssp in tm:
         for tsp in tm[ssp]:
           for ssw in ssp:
+            # use negative value to make it a distance value
             word_biphrase_table[ssw].append(biphrase(ssp, tuple(tsp.english.split()), -tsp.logprob))
-  
-  for ssw in word_biphrase_table: # prune all but top s translations
+  # prune all but top `top_s` biphrases per source word base on tm distance
+  # favoring efficiency over performance 
+  for ssw in word_biphrase_table:
     word_biphrase_table[ssw].sort(key=lambda x: x.distance)
     del word_biphrase_table[ssw][top_s:] 
 
   return word_biphrase_table
 
+# transforms the decoding problem into a GTSP graph
+# every word-biphrase (w,b) pair becomes a node
+# C1 - nodes with same w form clusters
+# C2 - (w, b) to (w', b) [w!=w'] type nodes are connected by a 0 distance edge if w and w' are consecutive
+# C3 - (w, b) to (w', b') [w!=w' && b!=b'] type nodes by (lm_distance + tm_distance + reorder_distance) 
+#   if w is the last word in b and w' is the first word in b'
+# Args:
+#   word_biphrase_table [Dict(biphrase)]: biphrases each source sentence word occurs in
+#   lm [models.LM]: language model
+#   ss [str]: source sentence
+# Returns:
+#   gtsp [np.ndarray]: distance matrix for gtsp graph
+#   clusters [Dict(set)]: clusters of bipphrases with same w
+#   nodes [List(node)]: ordered nodes of gtsp graph
 def create_gtsp(word_biphrase_table, lm, ss):
+  # order nodes
   nodes = [node(ssw, b) for ssw, bs in word_biphrase_table.items() for b in bs]
+  # initialise gtsp graph distance matrix (one extra dimension for start/end of sentence)
   gtsp = np.ones((len(nodes)+1, len(nodes)+1)) * LARGE
+  # initalise same w clusters
   clusters = defaultdict(set)
   for i in range(len(nodes)-1):
     for j in range(len(nodes)-1):
-
       if i == j:
         gtsp[i, j] = 0.
         continue
-
+      # C1
       if nodes[i].w == nodes[j].w:
         clusters[nodes[i].w].add(j)
+      # C2
       elif nodes[i].b == nodes[j].b and nodes[j].b.source.index(nodes[j].w) - nodes[i].b.source.index(nodes[i].w) == 1 :
         gtsp[i, j] = 0.
+      # C3
       elif nodes[i].w == nodes[i].b.source[-1] and nodes[j].w == nodes[j].b.source[0]:
         tm_distance = nodes[i].b.distance
         lm_distance = get_lm_distance(lm=lm, phrase=nodes[i].b.target+nodes[j].b.target)
         ds_distance = abs(ss.index(nodes[j].w) - ss.index(nodes[i].w) - 1)
         gtsp[i, j] = tm_distance + lm_distance + ds_distance
-  
+  # adding start/end of sentence edges  
   for n in range(len(nodes)):   
       gtsp[-1, n] = get_lm_distance(lm=lm, phrase=("<s>",)+nodes[n].b.target) + ss.index(nodes[n].w)
       gtsp[n, -1] = nodes[n].b.distance + get_lm_distance(lm=lm, phrase=nodes[n].b.target+("</s>",)) + len(ss) - ss.index(nodes[n].w) - 1
 
   return gtsp, clusters, nodes
 
-def gtsp_to_tsp(gtsp, clusters):
-  tsp = np.copy(gtsp)
+# transforms GTSP graph into ATSP graph
+# every cluster gets converted into a cycle with NLARGE (very large negative) distance
+# start point of an outgoing edge from a cluster node gets assigned to the node's predecessor in the cycle 
+# Args:
+#   gtsp [np.ndarray]: distance matrix for gtsp graph
+#   clusters [Dict(set)]: clusters of bipphrases with same w
+# Returns:
+#   atsp [np.ndarray]: distance matrix for atsp graph
+def gtsp_to_atsp(gtsp, clusters):
+  atsp = np.copy(gtsp)
   for w in clusters:
     cluster = list(clusters[w])
+    # initialise outgoing edge list
     oe = defaultdict(list)
     edge = namedtuple("e", "es, et, ed")
     # create cycle
@@ -76,25 +120,40 @@ def gtsp_to_tsp(gtsp, clusters):
       v_before = cluster[(u_idx-1)%len(cluster)]
       u = cluster[u_idx]
       v_next = cluster[(u_idx+1)%len(cluster)]
-      tsp[u, v_next] = NLARGE
-      # collect outgoing edge
-      for v in range(tsp.shape[1]):
+      atsp[u, v_next] = NLARGE
+      # collect outgoing edges
+      for v in range(atsp.shape[1]):
         if u == v:
           continue
-        if NLARGE < tsp[u, v] and tsp[u, v] < LARGE:
-          oe[u].append(edge(v_before, v, tsp[u, v]))
-          tsp[u, v] = LARGE
+        if NLARGE < atsp[u, v] and atsp[u, v] < LARGE:
+          oe[u].append(edge(v_before, v, atsp[u, v]))
+          atsp[u, v] = LARGE
     # correct outgoing edges
     for u in oe:
       for e in oe[u]:
-        tsp[e.es, e.et] = e.ed
-  return tsp
+        atsp[e.es, e.et] = e.ed
+  return atsp
 
+# solves tsp using 3rd party tsp-solver: python-tsp
+# source: https://github.com/fillipe-gsm/python-tsp
+# Args:
+#   tsp [np.ndarray]: distance matrix for tsp graph
+# Returns:
+#   opt_tour [list]: optimal tsp tour node order
 def solve_tsp(tsp):
-  # opt_tour, _ = solve_tsp_local_search(tsp, x0=solve_tsp_simulated_annealing(tsp)[0], perturbation_scheme="two_opt")
-  opt_tour, _ = solve_tsp_dynamic_programming(tsp)
+  # approximate solution with "two-opt" procedure with simulated annealling initialization
+  opt_tour, _ = solve_tsp_local_search(tsp, x0=solve_tsp_simulated_annealing(tsp)[0], perturbation_scheme="two_opt")
+  # exact solution with dynamic programming (compute intensive)
+  # opt_tour, _ = solve_tsp_dynamic_programming(tsp)
   return opt_tour
 
+# converts optimal tour into translation
+# Args:
+#   opt_tour [list]: optimal tsp tour node order
+#   nodes [List(node)]: ordered nodes of gtsp graph
+# Returns:
+#   translation [tuple]: translated sentence
+#   tm_distance [float]: translation model logrob as distance
 def tour_to_sentence(opt_tour, phrase_map):
   biphrases = []
   tm_distance = 0.
@@ -111,48 +170,48 @@ def tour_to_sentence(opt_tour, phrase_map):
     words.append(phrase_map[n].w)
     tm_distance += phrase_map[n].b.distance
   translation = sum(biphrases,())
-  return translation, tm_distance, words
-
-def log(g, c, f):
-  df = pd.DataFrame(g, columns=c)
-  df.insert(0, "idx", c)
-  print(df.to_string(), file=open(f, "w+"))
+  return translation, tm_distance
 
 def main(opts):
+  # initalize translation model
   tm = models.TM(opts.tm, opts.k)
+  # initialize language model
   lm = models.LM(opts.lm)
+  # get source sentences
   source = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
 
   # tm should translate unknown words as-is with probability 1
   for word in set(sum(source,())):
     if (word,) not in tm:
       tm[(word,)] = [models.phrase(word, 0.0)]
-  # ipdb.set_trace()
+
   sys.stderr.write("Decoding %s...\n" % (opts.input,))
   
   for ss in source: 
+    # create a word-biphrase table
     if opts.verbose:
       print("Creating biphrase table ...", file=sys.stderr)
     word_biphrase_table = create_word_biphrase_table(ss=ss, tm=tm, top_s=opts.s)
+    # transform the decoding task into a Generalized Travelling Salesman Problem (GTSP) graph 
     if opts.verbose:
       print("Creating GTSP ...", file=sys.stderr)
     gtsp, clusters, phrase_map = create_gtsp(word_biphrase_table=word_biphrase_table, lm=lm, ss=ss)  
-    log(gtsp, phrase_map+["<s>"], "gtsp")
+    # convert GTSP graph into Asymmetric Travelling Salesman Problem (ATSP) graph
     if opts.verbose:
       print("Converting GTSP to ATSP ...", file=sys.stderr)
-    tsp = gtsp_to_tsp(gtsp=gtsp, clusters=clusters)
-    log(tsp, phrase_map+["<s>"], "tsp")
+    tsp = gtsp_to_atsp(gtsp=gtsp, clusters=clusters)
+    # Solve ATSP
     if opts.verbose:
       print("Solving ATSP ...", file=sys.stderr)
     opt_tour = solve_tsp(tsp=tsp)
-    print(opt_tour)
-    translation, tm_distance, words = tour_to_sentence(opt_tour=opt_tour, phrase_map=phrase_map)
+    # Convert tour into translation
+    translation, tm_distance = tour_to_sentence(opt_tour=opt_tour, phrase_map=phrase_map)
 
     print(" ".join(translation))
     
     if opts.verbose:
       lm_distance = get_lm_distance(lm=lm, phrase=("<s>",)+translation+("</s>",))
-      sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % (lm_distance, tm_distance, tm_distance + lm_distance))
+      sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % (-lm_distance, -tm_distance, -tm_distance -lm_distance))
 
 if __name__ == "__main__":
   optparser = optparse.OptionParser()
