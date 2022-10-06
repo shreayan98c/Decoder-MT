@@ -1,0 +1,51 @@
+How to run the programs
+
+Decoder (baseline):
+
+1. Goto terminal and run the program
+python decode > translations
+
+2. To calculate the score, run:
+python compute-model-score < translations
+
+3. If the above statement gives an error (in some version of windows, it throws an error), then try
+Get-Content translations | python compute-model-score
+
+------------------------------------------------------------------------------------------------------------------------
+
+Decoder with Reordering:
+
+1. Goto terminal and run the program
+python decoder_reorder > translations_reordered
+
+2. To calculate the score, run:
+python compute-model-score < translations_reordered
+
+3. If the above statement gives an error (in some version of windows, it throws an error), then try
+Get-Content translations_reordered | python compute-model-score
+
+------------------------------------------------------------------------------------------------------------------------
+
+Decoder with Vector Coverage
+
+1. Goto terminal and run the program
+python decode_cover > translations_decode_cover
+
+2. To calculate the score, run:
+python compute-model-score < translations_decode_cover
+
+3. If the above statement gives an error (in some version of windows, it throws an error), then try
+Get-Content translations_decode_cover | python compute-model-score
+
+------------------------------------------------------------------------------------------------------------------------
+
+Decode with Travelling Salesman Problem
+
+1. Goto terminal and run the program
+python decode_tsp > translations_tsp
+
+2. To calculate the score, run:
+python compute-model-score < translations_tsp
+
+3. If the above statement gives an error (in some version of windows, it throws an error), then try
+Get-Content translations_tsp | python compute-model-score
